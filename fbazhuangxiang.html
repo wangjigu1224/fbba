@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>FBA装箱防错｜相机扫码版</title>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;font-family:system-ui}
+body{background:#f5f5f7;padding:8px;font-size:14px;max-width:100vw;overflow-x:hidden}
+.red{background:#dd2222;color:#fff}
+.orange{background:#ff8800;color:#fff}
+.green{background:#009933;color:#fff}
+.box{padding:12px;border-radius:8px;margin:8px 0;background:#fff}
+input,button{font-size:16px;padding:10px;margin:4px 2px;border-radius:6px;border:1px solid #cccccc}
+button{background:#006edc;color:white;border:none}
+table{width:100%;border-collapse:collapse;font-size:12px}
+td,th{border:1px solid #aaa;padding:6px}
+#scanInput{width:100%}
+.alert-area{min-height:48px;font-weight:bold}
+.num-input{width:60px}
+#videoContainer{position:relative;width:100%;background:#000;border-radius:8px;overflow:hidden;display:none}
+#cameraVideo{width:100%;display:block}
+#canvasHidden{display:none}
+</style>
+</head>
+<body>
+<h2>FBA装箱防错【相机扫码版】</h2>
+
+<div class="box">
+<h4>①导入装箱CSV（Excel xlsx另存为 CSV UTF‑8）</h4>
+<input type="file" id="fileInput" accept=".csv">
+<div id="info"></div>
+</div>
+
+<div class="box">
+<h4>②选择当前作业箱号</h4>
+<select id="boxSelect">
+<option value="">请先导入装箱文件</option>
+</select>
+<button onclick="clearCurrentBoxCount()">清空本箱计数</button>
+</div>
+
+<div class="box">
+<h4>③扫码</h4>
+<input id="scanInput" placeholder="硬件扫码枪 / 手动输入条码" autocomplete="off">
+<button id="openCamBtn" onclick="toggleCamera()">📷打开相机扫码</button>
+<div id="videoContainer">
+    <video id="cameraVideo" autoplay playsinline muted></video>
+    <canvas id="canvasHidden"></canvas>
+    <button onclick="stopCamera()" style="position:absolute;top:8px;right:8px;background:#f33;">关闭相机</button>
+</div>
+<div id="alertBox" class="box alert-area"></div>
+</div>
+
+<div class="box">
+<h4>本箱明细｜可以直接修改【已装】数量</h4>
+<table>
+<thead>
+<tr>
+<th>FNSKU</th>
+<th>MSKU</th>
+<th>应装</th>
+<th>已装(可改)</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody id="listBody"></tbody>
+</table>
+<div style="margin-top:8px">
+本箱应装合计：<span id="shouldTotal">0</span> 件，
+已装合计：<span id="doneTotal">0</span> 件
+</div>
+</div>
+
+<div class="box">
+<h4>④本箱记录重量与尺寸</h4>
+重量(kg):<input id="boxWeight" placeholder="0.00">
+长(cm):<input id="boxL" placeholder="长">
+宽(cm):<input id="boxW" placeholder="宽">
+高(cm):<input id="boxH" placeholder="高">
+<button onclick="saveBoxSize()">保存本箱尺寸重量</button>
+</div>
+
+<div class="box">
+<button onclick="exportAllData()">导出全部装箱记录CSV备份</button>
+<div>⚠️关闭标签页数据会丢失，装箱完成务必导出CSV备份</div>
+</div>
+
+<script>
+let packList = [];
+let currentBox = null;
+let boxScanCount = {};
+let boxSizeInfo = {};
+
+let videoElem = document.getElementById('cameraVideo');
+let canvasElem = document.getElementById('canvasHidden');
+let ctx = canvasElem.getContext('2d');
+let camStream = null;
+let scanLoop = null;
+
+const fileInput = document.getElementById("fileInput");
+const scanInput = document.getElementById("scanInput");
+const boxSelect = document.getElementById("boxSelect");
+const alertBox = document.getElementById("alertBox");
+const listBody = document.getElementById("listBody");
+const infoDiv = document.getElementById("info");
+const videoContainer = document.getElementById("videoContainer");
+const openCamBtn = document.getElementById("openCamBtn");
+
+fileInput.onchange = async function(e){
+    const file = e.target.files[0];
+    if(!file) return;
+    const text = await file.text();
+    parsePackCsv(text);
+};
+
+function parsePackCsv(csvText){
+    const lines = csvText.split(/\r?\n/).filter(line=>line.trim()!=='');
+    packList = [];
+    const headerRow = lines[0].split(',');
+
+    const idxMSKU = headerRow.findIndex(h=>h.includes("MSKU"));
+    const idxFNSKU = headerRow.findIndex(h=>h.includes("FNSKU"));
+    const idxSKU = headerRow.findIndex(h=>h.includes("SKU"));
+
+    let boxColumnList = [];
+    headerRow.forEach((colName,idx)=>{
+        if(colName.startsWith("第")){
+            boxColumnList.push({boxName:colName,colIndex:idx});
+        }
+    });
+
+    for(let i=1;i<lines.length;i++){
+        const cols = lines[i].split(',');
+        const msku = (cols[idxMSKU]||'').trim();
+        const fnsku = (cols[idxFNSKU]||'').trim();
+        if(!msku && !fnsku) continue;
+
+        const item = {
+            msku:msku,
+            fnsku:fnsku,
+            sku:(cols[idxSKU]||'').trim(),
+            boxRequireQty:{}
+        };
+        boxColumnList.forEach(col=>{
+            const qty = parseInt(cols[col.colIndex]||"0") || 0;
+            if(qty>0){
+                item.boxRequireQty[col.boxName] = qty;
+            }
+        });
+        packList.push(item);
+    }
+
+    const allBoxSet = new Set();
+    packList.forEach(it=>{
+        Object.keys(it.boxRequireQty).forEach(boxNo=>allBoxSet.add(boxNo));
+    });
+    const allBoxArr = Array.from(allBoxSet).sort();
+
+    boxScanCount = {};
+    allBoxArr.forEach(b=>boxScanCount[b]={});
+
+    boxSelect.innerHTML = "";
+    allBoxArr.forEach(boxName=>{
+        const opt = document.createElement("option");
+        opt.value = boxName;
+        opt.innerText = boxName;
+        boxSelect.appendChild(opt);
+    });
+    infoDiv.innerText = `✅导入完成，SKU总数：${packList.length}，总箱数：${allBoxArr.length}`;
+    boxSelect.onchange();
+}
+
+boxSelect.onchange = function(){
+    currentBox = boxSelect.value;
+    loadBoxSavedSize();
+    renderTable();
+    clearAlert();
+};
+
+scanInput.addEventListener("keydown",function(ev){
+    if(ev.key === "Enter"){
+        const code = scanInput.value.trim();
+        scanInput.value = "";
+        handleScanBarcode(code);
+    }
+});
+
+function handleScanBarcode(code){
+    clearAlert();
+    if(!currentBox){
+        showAlert("请先选择作业箱号！","red");
+        return;
+    }
+    const findItem = packList.find(p=>p.fnsku===code || p.msku===code);
+    if(!findItem){
+        showAlert(`⚠️条码【${code}】不在装箱清单内！`,"orange");
+        return;
+    }
+    const belongBoxes = Object.keys(findItem.boxRequireQty);
+    if(!belongBoxes.includes(currentBox)){
+        showAlert(`❌装错箱！该条码归属：${belongBoxes.join(",")}，禁止装入${currentBox}`,"red");
+        return;
+    }
+    const shouldQty = findItem.boxRequireQty[currentBox];
+    if(!boxScanCount[currentBox][findItem.fnsku]) boxScanCount[currentBox][findItem.fnsku]=0;
+    boxScanCount[currentBox][findItem.fnsku] += 1;
+    const nowNum = boxScanCount[currentBox][findItem.fnsku];
+
+    if(nowNum > shouldQty){
+        showAlert(`⚠️超装警告！应装${shouldQty}件，现已${nowNum}件`,"orange");
+    }else{
+        showAlert(`✅扫码成功 ${nowNum}/${shouldQty}`,"green");
+    }
+    renderTable();
+}
+
+function renderTable(){
+    listBody.innerHTML = "";
+    if(!currentBox) return;
+    let totalShould = 0;
+    let totalDone = 0;
+
+    packList.forEach(item=>{
+        const req = item.boxRequireQty[currentBox];
+        if(!req || req<=0) return;
+        totalShould += req;
+        const doneVal = boxScanCount[currentBox][item.fnsku]||0;
+        totalDone += doneVal;
+
+        const tr = document.createElement("tr");
+        let statusText = "待装";
+        if(doneVal >= req) statusText = "✅齐套";
+        else if(doneVal>0) statusText = "进行中";
+
+        tr.innerHTML = `
+        <td>${item.fnsku}</td>
+        <td>${item.msku}</td>
+        <td>${req}</td>
+        <td>
+            <input class="num-input" type="number" min="0" value="${doneVal}"
+            onchange="manualModifyCount('${item.fnsku}',this.value)">
+        </td>
+        <td>${statusText}</td>
+        `;
+        listBody.appendChild(tr);
+    });
+
+    document.getElementById("shouldTotal").innerText = totalShould;
+    document.getElementById("doneTotal").innerText = totalDone;
+
+    if(totalShould>0 && totalDone >= totalShould){
+        showAlert("🎉本箱全部齐套，可以封箱！","green");
+    }
+}
+
+function manualModifyCount(fnsku,inputVal){
+    const num = parseInt(inputVal)||0;
+    boxScanCount[currentBox][fnsku] = num;
+    renderTable();
+}
+
+function clearCurrentBoxCount(){
+    if(!currentBox) return;
+    boxScanCount[currentBox] = {};
+    renderTable();
+    showAlert("已清空本箱计数","green");
+}
+
+function loadBoxSavedSize(){
+    const info = boxSizeInfo[currentBox]||{};
+    document.getElementById("boxWeight").value = info.weight||"";
+    document.getElementById("boxL").value = info.L||"";
+    document.getElementById("boxW").value = info.W||"";
+    document.getElementById("boxH").value = info.H||"";
+}
+
+function saveBoxSize(){
+    if(!currentBox) return;
+    boxSizeInfo[currentBox] = {
+        weight:document.getElementById("boxWeight").value.trim(),
+        L:document.getElementById("boxL").value.trim(),
+        W:document.getElementById("boxW").value.trim(),
+        H:document.getElementById("boxH").value.trim()
+    };
+    showAlert(`✅已保存【${currentBox}】重量尺寸信息`,"green");
+}
+
+function exportAllData(){
+    let csvContent = "FNSKU,MSKU,箱号,应装数量,已装数量,箱重(kg),长cm,宽cm,高cm\n";
+    Object.keys(boxScanCount).forEach(boxNo=>{
+        const size = boxSizeInfo[boxNo]||{};
+        packList.forEach(item=>{
+            const reqQty = item.boxRequireQty[boxNo];
+            if(!reqQty) return;
+            const doneQty = boxScanCount[boxNo][item.fnsku]||0;
+            csvContent += `${item.fnsku},${item.msku},${boxNo},${reqQty},${doneQty},${size.weight||''},${size.L||''},${size.W||''},${size.H||''}\n`;
+        })
+    });
+    const blob = new Blob([csvContent],{type:"text/csv;charset=utf-8"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "FBA装箱全部记录.csv";
+    a.click();
+}
+
+function showAlert(text,cssClass){
+    alertBox.innerText = text;
+    alertBox.className = "box alert-area "+cssClass;
+}
+function clearAlert(){
+    alertBox.innerText = "";
+    alertBox.className = "box alert-area";
+}
+
+// 相机二维码/条码识别
+async function toggleCamera(){
+    if(camStream){
+        stopCamera();
+        return;
+    }
+    try{
+        camStream = await navigator.mediaDevices.getUserMedia({
+            video:{facingMode:'environment'}
+        });
+        videoElem.srcObject = camStream;
+        videoContainer.style.display='block';
+        openCamBtn.innerText="📷关闭相机";
+        requestAnimationFrame(scanFrame);
+    }catch(err){
+        showAlert("相机打开失败！⚠️本地file://不支持相机，需要HTTPS网页链接","red");
+        console.error(err);
+    }
+}
+
+function stopCamera(){
+    if(camStream){
+        camStream.getTracks().forEach(t=>t.stop());
+        camStream=null;
+    }
+    if(scanLoop){
+        cancelAnimationFrame(scanLoop);
+        scanLoop=null;
+    }
+    videoElem.srcObject=null;
+    videoContainer.style.display='none';
+    openCamBtn.innerText="📷打开相机扫码";
+}
+
+function scanFrame(){
+    if(!camStream) return;
+    if(videoElem.videoWidth===0){
+        scanLoop = requestAnimationFrame(scanFrame);
+        return;
+    }
+    canvasElem.width = videoElem.videoWidth;
+    canvasElem.height = videoElem.videoHeight;
+    ctx.drawImage(videoElem,0,0);
+    const imgData = ctx.getImageData(0,0,canvasElem.width,canvasElem.height);
+    const qrResult = jsQR(imgData.data,imgData.width,imgData.height);
+    if(qrResult){
+        handleScanBarcode(qrResult.data.trim());
+    }
+    scanLoop = requestAnimationFrame(scanFrame);
+}
+</script>
+</body>
+</html>
